@@ -7,7 +7,7 @@
 
     <groupId>com.security.sugarcrm</groupId>
     <artifactId>sugarcrm-burp-scanner</artifactId>
-    <version>1.0.0</version>
+    <version>2.0.0</version>
     <packaging>jar</packaging>
     <name>SugarCRM Burp Suite Pro Scanner</name>
 

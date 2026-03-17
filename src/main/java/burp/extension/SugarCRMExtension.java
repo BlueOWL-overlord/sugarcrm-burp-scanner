@@ -27,7 +27,7 @@ public class SugarCRMExtension implements BurpExtension {
     @Override
     public void initialize(MontoyaApi montoyaApi) {
         api = montoyaApi;
-        api.extension().setName("SugarCRM Auto Scanner");
+        api.extension().setName("SugarCRM Auto Scanner v2.0");
 
         // Shared config (target URL, credentials, session cookie)
         ExtensionConfig config = new ExtensionConfig();
@@ -58,6 +58,8 @@ public class SugarCRMExtension implements BurpExtension {
             }
         });
 
-        api.logging().logToOutput("[SugarCRM Scanner] Extension loaded. Open the 'SugarCRM Scanner' tab to configure.");
+        api.logging().logToOutput("[SugarCRM Scanner v2.0] Extension loaded.");
+        api.logging().logToOutput("[SugarCRM Scanner v2.0] Features: Navigation-Recorder JSON login · Test-case selection · Intrusive-test approval · Browser simulation narration · Extended CVE probes");
+        api.logging().logToOutput("[SugarCRM Scanner v2.0] Open the 'SugarCRM Scanner' tab to configure.");
     }
 }

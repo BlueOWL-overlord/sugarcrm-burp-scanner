@@ -7,6 +7,8 @@ import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
 import burp.api.montoya.proxy.ProxyHttpRequestResponse;
 import burp.extension.ExtensionConfig;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.jsoup.Jsoup;
@@ -14,6 +16,7 @@ import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -21,17 +24,19 @@ import java.util.regex.Pattern;
  * AuthManager handles:
  *  1. Fresh login via SugarCRM's web form (classic UI)
  *  2. OAuth2 token acquisition via REST API v8
- *  3. Extraction of session from Burp Proxy history (recorded login mode)
- *  4. HTTP handler: injects the live session cookie into all in-scope requests
+ *  3. Extraction of session from Burp Proxy history (recorded session mode)
+ *  4. Replay of a Burp Navigation-Recorder JSON sequence for automated re-login
+ *  5. HTTP handler: injects the live session cookie into all in-scope requests
  */
 public class AuthManager implements HttpHandler {
 
-    private final MontoyaApi api;
+    private final MontoyaApi      api;
     private final ExtensionConfig config;
 
-    // Patterns for extracting tokens from HTML
-    private static final Pattern CSRF_PATTERN   = Pattern.compile("name=['\"]sugar_token['\"]\\s+value=['\"]([^'\"]+)['\"]");
-    private static final Pattern SESSION_PATTERN = Pattern.compile("PHPSESSID=([^;\\s]+)");
+    private static final Pattern CSRF_PATTERN    = Pattern.compile(
+        "name=['\"]sugar_token['\"]\\s+value=['\"]([^'\"]+)['\"]");
+    private static final Pattern SESSION_PATTERN = Pattern.compile(
+        "PHPSESSID=([^;\\s]+)");
 
     public AuthManager(MontoyaApi api, ExtensionConfig config) {
         this.api    = api;
@@ -42,24 +47,181 @@ public class AuthManager implements HttpHandler {
 
     /**
      * Performs login based on config:
-     *  - If useRecordedSession=true, scans Burp Proxy history for a valid session.
-     *  - Otherwise, performs a fresh web-form login + REST OAuth2 login.
+     *  a) Navigation-Recorder JSON is set  → replay the recorded sequence
+     *  b) useRecordedSession=true + cookie  → verify existing session
+     *  c) useRecordedSession=true (no cookie) → scan Burp Proxy history
+     *  d) default                           → fresh web + OAuth2 login
      *
      * @return true if authentication succeeded
      */
     public boolean login() {
+        return login(msg -> api.logging().logToOutput(msg));
+    }
+
+    public boolean login(Consumer<String> logger) {
+        // Navigation-Recorder JSON takes highest priority
+        if (config.isUseNavigationRecorderJson()
+                && !config.getRecordedLoginJson().isBlank()) {
+            logger.accept("[Auth] Using Navigation-Recorder JSON for login.");
+            return loginFromRecordedJson(config.getRecordedLoginJson(), logger);
+        }
+
         if (config.isUseRecordedSession() && !config.getSessionCookie().isBlank()) {
-            // Caller pre-filled session cookie from the UI — verify it works
-            return verifySession();
+            logger.accept("[Auth] Verifying existing recorded session.");
+            return verifySession(logger);
         }
 
         if (config.isUseRecordedSession()) {
-            // Extract session from Burp Proxy history
-            return extractSessionFromProxyHistory();
+            logger.accept("[Auth] Extracting session from Burp Proxy history.");
+            return extractSessionFromProxyHistory(logger);
         }
 
-        // Fresh login
-        return performWebLogin() && performOAuthLogin();
+        logger.accept("[Auth] Performing fresh web + OAuth2 login.");
+        return performWebLogin(logger) && performOAuthLogin(logger);
+    }
+
+    /**
+     * Parses a Burp Navigation-Recorder JSON (or any compatible HTTP-steps JSON)
+     * and replays each HTTP request in sequence, capturing the session cookie.
+     *
+     * Supported formats:
+     *
+     * 1. Array of step objects (Burp navigation recorder / custom):
+     *    [ { "method":"GET",  "url":"...", "headers":{}, "body":"" },
+     *      { "method":"POST", "url":"...", "headers":{"Content-Type":"..."}, "body":"..." } ]
+     *
+     * 2. Single object with a "steps" or "requests" key containing the above array.
+     *
+     * 3. Array of Burp macro-style request objects:
+     *    [ { "request": { "method":"POST", "url":"...", "body":"..." } } ]
+     *
+     * The method extracts PHPSESSID from Set-Cookie headers and sugar_token
+     * from response HTML after the sequence completes.
+     */
+    public boolean loginFromRecordedJson(String json, Consumer<String> logger) {
+        try {
+            JsonElement root = JsonParser.parseString(json.trim());
+            JsonArray steps;
+
+            if (root.isJsonArray()) {
+                steps = root.getAsJsonArray();
+            } else if (root.isJsonObject()) {
+                JsonObject obj = root.getAsJsonObject();
+                // Try "steps", "requests", or "macro" keys
+                if      (obj.has("steps"))    steps = obj.getAsJsonArray("steps");
+                else if (obj.has("requests")) steps = obj.getAsJsonArray("requests");
+                else if (obj.has("macro"))    steps = obj.getAsJsonArray("macro");
+                else {
+                    // Treat the whole object as a single request step
+                    steps = new JsonArray();
+                    steps.add(obj);
+                }
+            } else {
+                logger.accept("[Auth] Recorded JSON is neither an object nor an array.");
+                return false;
+            }
+
+            logger.accept("[Auth] Replaying " + steps.size() + " recorded step(s)...");
+
+            for (int i = 0; i < steps.size(); i++) {
+                JsonElement el = steps.get(i);
+                if (!el.isJsonObject()) continue;
+                JsonObject step = el.getAsJsonObject();
+
+                // Unwrap Burp macro-style { "request": {...} }
+                if (step.has("request") && step.get("request").isJsonObject()) {
+                    step = step.getAsJsonObject("request");
+                }
+
+                String method = getStr(step, "method", "GET").toUpperCase();
+                String url    = getStr(step, "url", "");
+                String body   = getStr(step, "body", "");
+
+                if (url.isBlank()) {
+                    logger.accept("[Auth] Step " + (i + 1) + ": no URL — skipping.");
+                    continue;
+                }
+
+                // Build request
+                HttpRequest req = HttpRequest.httpRequestFromUrl(url)
+                        .withMethod(method)
+                        .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/2.0)");
+
+                // Inject current session cookie if we have one
+                if (!config.getSessionCookie().isBlank()) {
+                    req = req.withHeader("Cookie", config.getSessionCookie());
+                }
+
+                // Apply custom headers from the recorded step
+                if (step.has("headers") && step.get("headers").isJsonObject()) {
+                    for (var entry : step.getAsJsonObject("headers").entrySet()) {
+                        String hName  = entry.getKey();
+                        String hValue = entry.getValue().getAsString();
+                        req = req.withHeader(hName, hValue);
+                    }
+                } else if (step.has("headers") && step.get("headers").isJsonArray()) {
+                    // Array of { "name":..., "value":... }
+                    for (JsonElement hEl : step.getAsJsonArray("headers")) {
+                        if (!hEl.isJsonObject()) continue;
+                        JsonObject h = hEl.getAsJsonObject();
+                        String hName  = getStr(h, "name",  "");
+                        String hValue = getStr(h, "value", "");
+                        if (!hName.isBlank()) req = req.withHeader(hName, hValue);
+                    }
+                }
+
+                // Set body for POST/PUT/PATCH
+                if (!body.isBlank() && (method.equals("POST") || method.equals("PUT") || method.equals("PATCH"))) {
+                    if (req.headerValue("Content-Type") == null) {
+                        req = req.withHeader("Content-Type", "application/x-www-form-urlencoded");
+                    }
+                    req = req.withBody(body);
+                }
+
+                logger.accept("[Auth] Step " + (i + 1) + ": " + method + " " + url);
+                HttpRequestResponse rr = api.http().sendRequest(req);
+                if (rr.response() == null) {
+                    logger.accept("[Auth]   → No response.");
+                    continue;
+                }
+
+                int status = rr.response().statusCode();
+                logger.accept("[Auth]   → HTTP " + status);
+
+                // Capture PHPSESSID from Set-Cookie
+                String setCookie = rr.response().headerValue("Set-Cookie");
+                if (setCookie != null) {
+                    Matcher m = SESSION_PATTERN.matcher(setCookie);
+                    if (m.find()) {
+                        config.setSessionCookie("PHPSESSID=" + m.group(1));
+                        logger.accept("[Auth]   → Captured PHPSESSID from Set-Cookie.");
+                    }
+                }
+
+                // Try to extract sugar_token from HTML response
+                if (rr.response().bodyToString().contains("sugar_token")) {
+                    String token = parseCsrfToken(rr.response().bodyToString());
+                    if (!token.isEmpty()) {
+                        config.setSugarToken(token);
+                        logger.accept("[Auth]   → Captured sugar_token.");
+                    }
+                }
+            }
+
+            // Also acquire OAuth2 token if we now have credentials
+            if (!config.getSessionCookie().isBlank()) {
+                performOAuthLogin(logger);
+            }
+
+            boolean valid = verifySession(logger);
+            logger.accept("[Auth] Navigation-Recorder replay " + (valid ? "SUCCEEDED" : "FAILED") + ".");
+            return valid;
+
+        } catch (Exception e) {
+            logger.accept("[Auth] Navigation-Recorder JSON parse/replay error: " + e.getMessage());
+            api.logging().logToError("[Auth] recordedJson error: " + e.getMessage());
+            return false;
+        }
     }
 
     /**
@@ -67,6 +229,10 @@ public class AuthManager implements HttpHandler {
      * extracts the session cookie from its response.
      */
     public boolean extractSessionFromProxyHistory() {
+        return extractSessionFromProxyHistory(msg -> api.logging().logToOutput(msg));
+    }
+
+    public boolean extractSessionFromProxyHistory(Consumer<String> logger) {
         List<ProxyHttpRequestResponse> history = api.proxy().history();
         String target = config.getTargetUrl();
 
@@ -80,7 +246,6 @@ public class AuthManager implements HttpHandler {
             String url = req.url();
             if (!url.startsWith(target)) continue;
 
-            // Find login POST: module=Users&action=Authenticate
             if (req.method().equalsIgnoreCase("POST")
                     && req.bodyToString().contains("action=Authenticate")) {
 
@@ -90,107 +255,84 @@ public class AuthManager implements HttpHandler {
                 Matcher m = SESSION_PATTERN.matcher(setCookie);
                 if (m.find()) {
                     config.setSessionCookie("PHPSESSID=" + m.group(1));
-                    api.logging().logToOutput("[Auth] Extracted PHPSESSID from Proxy history.");
-                    // Also try to grab sugar_token from a subsequent response
+                    logger.accept("[Auth] Extracted PHPSESSID from Proxy history.");
                     extractTokenFromHistory(history, i + 1);
-                    return verifySession();
+                    return verifySession(logger);
                 }
             }
         }
 
-        api.logging().logToError("[Auth] No SugarCRM login found in Proxy history.");
+        logger.accept("[Auth] No SugarCRM login found in Proxy history.");
         return false;
     }
 
-    // ─── Private methods ──────────────────────────────────────────────────────
+    // ─── Private login methods ────────────────────────────────────────────────
 
-    /**
-     * Two-step web login:
-     *  Step 1 – GET /index.php  -> parse sugar_token (CSRF)
-     *  Step 2 – POST /index.php?module=Users&action=Authenticate
-     */
-    private boolean performWebLogin() {
+    private boolean performWebLogin(Consumer<String> logger) {
         try {
-            // Step 1: GET the login page to retrieve the CSRF token
             HttpRequest getLogin = HttpRequest.httpRequestFromUrl(config.getTargetUrl() + "/index.php")
                     .withMethod("GET")
-                    .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/1.0)");
+                    .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/2.0)");
 
             HttpRequestResponse getResp = api.http().sendRequest(getLogin);
             if (getResp.response() == null) {
-                api.logging().logToError("[Auth] No response to login page GET");
+                logger.accept("[Auth] No response to login page GET");
                 return false;
             }
 
-            // Parse sugar_token from HTML
-            String html = getResp.response().bodyToString();
+            String html      = getResp.response().bodyToString();
             String csrfToken = parseCsrfToken(html);
 
-            // Extract session cookie from the GET response
             String setCookieGet = getResp.response().headerValue("Set-Cookie");
             if (setCookieGet != null) {
                 Matcher m = SESSION_PATTERN.matcher(setCookieGet);
-                if (m.find()) {
-                    config.setSessionCookie("PHPSESSID=" + m.group(1));
-                }
+                if (m.find()) config.setSessionCookie("PHPSESSID=" + m.group(1));
             }
 
-            // Step 2: POST credentials
             String body = "module=Users"
                     + "&action=Authenticate"
-                    + "&user_name=" + urlEncode(config.getUsername())
+                    + "&user_name="     + urlEncode(config.getUsername())
                     + "&user_password=" + urlEncode(md5Hex(config.getPassword()))
-                    + "&sugar_token=" + urlEncode(csrfToken)
+                    + "&sugar_token="   + urlEncode(csrfToken)
                     + "&login_module=Users"
                     + "&login_action=DetailView";
 
             HttpRequest postLogin = HttpRequest.httpRequestFromUrl(config.getTargetUrl() + "/index.php")
                     .withMethod("POST")
                     .withHeader("Content-Type", "application/x-www-form-urlencoded")
-                    .withHeader("Cookie", config.getSessionCookie())
-                    .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/1.0)")
+                    .withHeader("Cookie",       config.getSessionCookie())
+                    .withHeader("User-Agent",   "Mozilla/5.0 (SugarCRM-BurpScanner/2.0)")
                     .withBody(body);
 
             HttpRequestResponse postResp = api.http().sendRequest(postLogin);
             if (postResp.response() == null) {
-                api.logging().logToError("[Auth] No response to login POST");
+                logger.accept("[Auth] No response to login POST");
                 return false;
             }
 
-            // Grab updated session cookie from login response
             String setCookiePost = postResp.response().headerValue("Set-Cookie");
             if (setCookiePost != null) {
                 Matcher m = SESSION_PATTERN.matcher(setCookiePost);
-                if (m.find()) {
-                    config.setSessionCookie("PHPSESSID=" + m.group(1));
-                }
+                if (m.find()) config.setSessionCookie("PHPSESSID=" + m.group(1));
             }
 
-            // Store CSRF token
-            if (!csrfToken.isEmpty()) {
-                config.setSugarToken(csrfToken);
-            }
+            if (!csrfToken.isEmpty()) config.setSugarToken(csrfToken);
 
-            // Verify redirect to home (successful login)
-            int status = postResp.response().statusCode();
+            int    status   = postResp.response().statusCode();
             String location = postResp.response().headerValue("Location");
             boolean ok = (status == 302 && location != null && !location.contains("action=Login"))
                       || (status == 200 && postResp.response().bodyToString().contains("Home"));
 
-            api.logging().logToOutput("[Auth] Web login " + (ok ? "succeeded" : "FAILED") + " (HTTP " + status + ")");
+            logger.accept("[Auth] Web login " + (ok ? "succeeded" : "FAILED") + " (HTTP " + status + ")");
             return ok;
 
         } catch (Exception e) {
-            api.logging().logToError("[Auth] Web login exception: " + e.getMessage());
+            logger.accept("[Auth] Web login exception: " + e.getMessage());
             return false;
         }
     }
 
-    /**
-     * Acquire a REST API OAuth2 bearer token via /api/v8/oauth2/token
-     * This is used for REST API scan coverage.
-     */
-    private boolean performOAuthLogin() {
+    private boolean performOAuthLogin(Consumer<String> logger) {
         try {
             String body = "{"
                     + "\"grant_type\":\"password\","
@@ -204,7 +346,7 @@ public class AuthManager implements HttpHandler {
             HttpRequest req = HttpRequest.httpRequestFromUrl(config.getTargetUrl() + "/api/v8/oauth2/token")
                     .withMethod("POST")
                     .withHeader("Content-Type", "application/json")
-                    .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/1.0)")
+                    .withHeader("User-Agent",   "Mozilla/5.0 (SugarCRM-BurpScanner/2.0)")
                     .withBody(body);
 
             HttpRequestResponse resp = api.http().sendRequest(req);
@@ -214,46 +356,54 @@ public class AuthManager implements HttpHandler {
                 JsonObject json = JsonParser.parseString(resp.response().bodyToString()).getAsJsonObject();
                 if (json.has("access_token")) {
                     config.setOauthToken(json.get("access_token").getAsString());
-                    api.logging().logToOutput("[Auth] OAuth2 token acquired.");
+                    logger.accept("[Auth] OAuth2 token acquired.");
                     return true;
                 }
             }
 
-            api.logging().logToOutput("[Auth] OAuth2 login failed (HTTP " + resp.response().statusCode() + ")");
+            logger.accept("[Auth] OAuth2 login failed (HTTP " + resp.response().statusCode() + ")");
             return false;
 
         } catch (Exception e) {
-            api.logging().logToError("[Auth] OAuth2 login exception: " + e.getMessage());
+            logger.accept("[Auth] OAuth2 login exception: " + e.getMessage());
             return false;
         }
     }
 
-    /**
-     * Makes a lightweight authenticated request to verify the current session.
-     */
-    private boolean verifySession() {
+    private boolean performOAuthLogin() {
+        return performOAuthLogin(msg -> api.logging().logToOutput(msg));
+    }
+
+    // ─── Session verification ─────────────────────────────────────────────────
+
+    public boolean verifySession() {
+        return verifySession(msg -> api.logging().logToOutput(msg));
+    }
+
+    public boolean verifySession(Consumer<String> logger) {
         try {
-            HttpRequest req = HttpRequest.httpRequestFromUrl(config.getTargetUrl() + "/index.php?module=Home&action=index")
+            HttpRequest req = HttpRequest.httpRequestFromUrl(
+                        config.getTargetUrl() + "/index.php?module=Home&action=index")
                     .withMethod("GET")
-                    .withHeader("Cookie", config.getSessionCookie())
-                    .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/1.0)");
+                    .withHeader("Cookie",     config.getSessionCookie())
+                    .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/2.0)");
 
             HttpRequestResponse resp = api.http().sendRequest(req);
             if (resp.response() == null) return false;
 
-            String body = resp.response().bodyToString();
-            // If we see the login form, session is dead
-            boolean valid = !body.contains("action=Login") && !body.contains("user_name");
-            api.logging().logToOutput("[Auth] Session verification: " + (valid ? "VALID" : "INVALID"));
+            String body  = resp.response().bodyToString();
+            boolean valid = !body.contains("action=Login") && !body.contains("\"user_name\"");
+            logger.accept("[Auth] Session verification: " + (valid ? "VALID" : "INVALID"));
             return valid;
 
         } catch (Exception e) {
-            api.logging().logToError("[Auth] Session verify exception: " + e.getMessage());
+            logger.accept("[Auth] Session verify exception: " + e.getMessage());
             return false;
         }
     }
 
-    /** Scans proxy history entries after `startIdx` to find a sugar_token in HTML. */
+    // ─── Utility helpers ──────────────────────────────────────────────────────
+
     private void extractTokenFromHistory(List<ProxyHttpRequestResponse> history, int startIdx) {
         for (int i = startIdx; i < Math.min(history.size(), startIdx + 20); i++) {
             HttpResponse resp = history.get(i).response();
@@ -273,13 +423,10 @@ public class AuthManager implements HttpHandler {
 
     @Override
     public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent req) {
-        // Only inject into requests targeting our configured SugarCRM host
         if (!config.isAuthenticated()) return RequestToBeSentAction.continueWith(req);
         if (!req.url().startsWith(config.getTargetUrl())) return RequestToBeSentAction.continueWith(req);
 
         HttpRequest modified = req;
-
-        // Inject web session cookie
         if (!config.getSessionCookie().isBlank()) {
             String existing = req.headerValue("Cookie");
             if (existing == null || !existing.contains("PHPSESSID=")) {
@@ -289,55 +436,41 @@ public class AuthManager implements HttpHandler {
                 modified = modified.withHeader("Cookie", newCookie);
             }
         }
-
         return RequestToBeSentAction.continueWith(modified);
     }
 
     @Override
     public ResponseReceivedAction handleHttpResponseReceived(HttpResponseReceived resp) {
-        // Capture refreshed session cookies proactively
         String setCookie = resp.headerValue("Set-Cookie");
         if (setCookie != null && setCookie.contains("PHPSESSID=")) {
             Matcher m = SESSION_PATTERN.matcher(setCookie);
-            if (m.find()) {
-                config.setSessionCookie("PHPSESSID=" + m.group(1));
-            }
+            if (m.find()) config.setSessionCookie("PHPSESSID=" + m.group(1));
         }
         return ResponseReceivedAction.continueWith(resp);
     }
 
-    // ─── Utility helpers ──────────────────────────────────────────────────────
+    // ─── Parsing helpers ──────────────────────────────────────────────────────
 
     private String parseCsrfToken(String html) {
-        // Try regex first (faster)
         Matcher m = CSRF_PATTERN.matcher(html);
         if (m.find()) return m.group(1);
-
-        // Fall back to Jsoup DOM parsing
         try {
             Document doc = Jsoup.parse(html);
-            Element el = doc.selectFirst("input[name=sugar_token]");
+            Element el   = doc.selectFirst("input[name=sugar_token]");
             if (el != null) return el.val();
         } catch (Exception ignored) {}
         return "";
     }
 
     private String urlEncode(String s) {
-        try {
-            return java.net.URLEncoder.encode(s, "UTF-8");
-        } catch (Exception e) {
-            return s;
-        }
+        try { return java.net.URLEncoder.encode(s, "UTF-8"); }
+        catch (Exception e) { return s; }
     }
 
     private String jsonEscape(String s) {
         return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
-    /**
-     * SugarCRM stores the password as MD5(password).
-     * In some versions it is MD5(password) hex-encoded.
-     */
     private String md5Hex(String input) {
         try {
             java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
@@ -345,8 +478,11 @@ public class AuthManager implements HttpHandler {
             StringBuilder sb = new StringBuilder();
             for (byte b : digest) sb.append(String.format("%02x", b));
             return sb.toString();
-        } catch (Exception e) {
-            return input; // fallback — some Sugar versions accept plain text
-        }
+        } catch (Exception e) { return input; }
+    }
+
+    private String getStr(JsonObject obj, String key, String defaultVal) {
+        if (!obj.has(key) || obj.get(key).isJsonNull()) return defaultVal;
+        return obj.get(key).getAsString();
     }
 }

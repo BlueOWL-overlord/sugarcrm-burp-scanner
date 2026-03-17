@@ -49,6 +49,11 @@ public class UserActionSimulator {
     private static final String PROBE_COMPANY  = "BurpTestCo";
     private static final String PROBE_DESC     = "Automated security probe - safe to delete";
 
+    // CSV injection payload (safe — only dangerous if opened in a spreadsheet tool)
+    private static final String CSV_INJECT_PAYLOAD = "=CMD|' /C calc'!A0";
+    // Stored XSS probe (unique marker so we can verify reflection)
+    private static final String STORED_XSS_MARKER  = "BurpXSSProbe7x9q";
+
     public UserActionSimulator(MontoyaApi api, ExtensionConfig config) {
         this.api    = api;
         this.config = config;
@@ -62,6 +67,8 @@ public class UserActionSimulator {
         List<HttpRequest> generated = new ArrayList<>();
 
         logger.accept("[Simulator] Starting user action simulation...");
+        browserStep(logger, "Opening SugarCRM dashboard...",
+            "URL: " + config.getTargetUrl() + "/index.php?module=Home&action=index");
 
         simulateCreateAccount(generated, logger);
         simulateCreateContact(generated, logger);
@@ -70,12 +77,15 @@ public class UserActionSimulator {
         simulateCreateCase(generated, logger);
         simulateSearch(generated, logger);
         simulateQuickSearch(generated, logger);
+        simulateStoredXssCheck(generated, logger);
         simulateFileUpload(generated, logger);
         simulateVCardImport(generated, logger);
         simulateCsvImport(generated, logger);
         simulateExport(generated, logger);
         simulatePasswordChange(generated, logger);
         simulateEmailCompose(generated, logger);
+        simulateDuplicateAccountCheck(generated, logger);
+        simulateRestApiCrud(generated, logger);
 
         if (config.isTestAdminEndpoints()) {
             simulateAdminActions(generated, logger);
@@ -88,10 +98,18 @@ public class UserActionSimulator {
         return generated;
     }
 
+    /** Narrate a browser step if simulation logging is on. */
+    private void browserStep(Consumer<String> logger, String... steps) {
+        if (!config.isShowBrowserSimulation()) return;
+        for (String step : steps) logger.accept("[Browser] " + step);
+    }
+
     // ─── Individual simulations ───────────────────────────────────────────────
 
     private void simulateCreateAccount(List<HttpRequest> out, Consumer<String> log) {
         log.accept("[Simulator] Creating test Account...");
+        browserStep(log, "Click: Accounts → Create Account",
+            "Filling form: Name='" + PROBE_NAME + "_Account', Email, Phone, Website");
         String body = "module=Accounts"
                 + "&action=Save"
                 + "&sugar_token=" + urlEncode(config.getSugarToken())
@@ -415,6 +433,114 @@ public class UserActionSimulator {
         out.add(get("/index.php?module=Administration&action=DiagnosticRun"));
     }
 
+    /**
+     * Creates a record with a stored XSS payload in the description field,
+     * then fetches the list view to check if the payload is reflected.
+     */
+    private void simulateStoredXssCheck(List<HttpRequest> out, Consumer<String> log) {
+        log.accept("[Simulator] Testing stored XSS via record description...");
+        browserStep(log, "Click: Accounts → Create Account",
+            "Injecting XSS marker into description field: " + STORED_XSS_MARKER);
+
+        String xssPayload = "<script>" + STORED_XSS_MARKER + "</script>";
+        String body = "module=Accounts"
+                + "&action=Save"
+                + "&sugar_token=" + urlEncode(config.getSugarToken())
+                + "&name=BurpXSSTest"
+                + "&description=" + urlEncode(xssPayload);
+        HttpRequest create = post("/index.php", body);
+        out.add(create);
+        String id = sendAndExtractId(create);
+
+        // Fetch list view and detail view to check reflection
+        out.add(get("/index.php?module=Accounts&action=index&searchFormTab=basic_search&query=true&search_name=BurpXSSTest"));
+        if (id != null) {
+            out.add(get("/index.php?module=Accounts&action=DetailView&record=" + id));
+            createdRecordIds.add("Accounts:" + id);
+        }
+    }
+
+    /**
+     * Attempts to create a duplicate Account (same name) to test duplicate-handling
+     * and business logic for uniqueness enforcement.
+     */
+    private void simulateDuplicateAccountCheck(List<HttpRequest> out, Consumer<String> log) {
+        log.accept("[Simulator] Testing duplicate record creation...");
+        browserStep(log, "Attempting to create a duplicate Account (same name)...");
+
+        String body = "module=Accounts"
+                + "&action=Save"
+                + "&sugar_token=" + urlEncode(config.getSugarToken())
+                + "&name=" + urlEncode(PROBE_NAME + "_Account")  // same name as the one already created
+                + "&description=DuplicateProbe";
+        out.add(post("/index.php", body));
+    }
+
+    /**
+     * REST API CRUD simulation — creates, reads, updates, and deletes a Contact
+     * via the v8 API to test mass assignment and ACL enforcement.
+     */
+    private void simulateRestApiCrud(List<HttpRequest> out, Consumer<String> log) {
+        if (!config.isTestRestApi() || config.getOauthToken().isBlank()) return;
+        log.accept("[Simulator] REST API v8 CRUD simulation...");
+        browserStep(log, "REST API: POST /api/v8/Contacts (create)",
+            "REST API: GET /api/v8/Contacts (list)",
+            "REST API: PATCH /api/v8/Contacts/{id} with extra fields (mass assignment test)");
+
+        String base = config.getTargetUrl();
+
+        // Create via REST
+        String createBody = "{\"first_name\":\"BurpRest\",\"last_name\":\"Contact\","
+            + "\"email1\":\"" + PROBE_EMAIL + "\","
+            + "\"description\":\"" + PROBE_DESC + "\","
+            + "\"is_admin\":\"1\""  // mass assignment probe field
+            + "}";
+        HttpRequest createReq = HttpRequest.httpRequestFromUrl(base + "/api/v8/Contacts")
+                .withMethod("POST")
+                .withHeader("Content-Type", "application/json")
+                .withHeader("Accept", "application/json")
+                .withHeader("Authorization", "Bearer " + config.getOauthToken())
+                .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/2.0)")
+                .withBody(createBody);
+        out.add(createReq);
+        String id = sendAndExtractIdRest(createReq);
+
+        // List / filter
+        out.add(HttpRequest.httpRequestFromUrl(base + "/api/v8/Contacts?fields=id,first_name,last_name,is_admin,user_type")
+                .withMethod("GET")
+                .withHeader("Accept", "application/json")
+                .withHeader("Authorization", "Bearer " + config.getOauthToken())
+                .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/2.0)"));
+
+        if (id != null) {
+            // PATCH with privilege-escalation fields
+            String patchBody = "{\"is_admin\":\"1\",\"user_type\":\"Administrator\","
+                + "\"system_generated_password\":\"0\"}";
+            out.add(HttpRequest.httpRequestFromUrl(base + "/api/v8/Contacts/" + id)
+                    .withMethod("PATCH")
+                    .withHeader("Content-Type", "application/json")
+                    .withHeader("Accept", "application/json")
+                    .withHeader("Authorization", "Bearer " + config.getOauthToken())
+                    .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/2.0)")
+                    .withBody(patchBody));
+
+            // DELETE
+            out.add(HttpRequest.httpRequestFromUrl(base + "/api/v8/Contacts/" + id)
+                    .withMethod("DELETE")
+                    .withHeader("Authorization", "Bearer " + config.getOauthToken())
+                    .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/2.0)"));
+        }
+
+        // Bulk operations probe
+        out.add(HttpRequest.httpRequestFromUrl(base + "/api/v8/bulk")
+                .withMethod("POST")
+                .withHeader("Content-Type", "application/json")
+                .withHeader("Accept", "application/json")
+                .withHeader("Authorization", "Bearer " + config.getOauthToken())
+                .withHeader("User-Agent", "Mozilla/5.0 (SugarCRM-BurpScanner/2.0)")
+                .withBody("{\"requests\":[{\"url\":\"/api/v8/me\",\"method\":\"GET\"}]}"));
+    }
+
     /** Delete all records created during this session. */
     private void cleanupCreatedRecords(List<HttpRequest> out, Consumer<String> log) {
         log.accept("[Simulator] Cleaning up " + createdRecordIds.size() + " created test records...");
@@ -492,5 +618,19 @@ public class UserActionSimulator {
     private String urlEncode(String s) {
         try { return java.net.URLEncoder.encode(s, "UTF-8"); }
         catch (Exception e) { return s; }
+    }
+
+    /** Extract ID from a REST API JSON response body. */
+    private String sendAndExtractIdRest(HttpRequest req) {
+        try {
+            HttpRequestResponse resp = api.http().sendRequest(req);
+            if (resp.response() == null) return null;
+            String body = resp.response().bodyToString();
+            Matcher m = UUID_PATTERN.matcher(body);
+            if (m.find()) return m.group(1);
+        } catch (Exception e) {
+            api.logging().logToError("[Simulator] REST ID extract: " + e.getMessage());
+        }
+        return null;
     }
 }
