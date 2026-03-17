@@ -208,14 +208,29 @@ public class AuthManager implements HttpHandler {
                 }
             }
 
-            // Also acquire OAuth2 token if we now have credentials
-            if (!config.getSessionCookie().isBlank()) {
+            // Acquire OAuth2 token if we captured a web session
+            boolean hasCookie = !config.getSessionCookie().isBlank();
+            if (hasCookie) {
                 performOAuthLogin(logger);
             }
 
-            boolean valid = verifySession(logger);
-            logger.accept("[Auth] Navigation-Recorder replay " + (valid ? "SUCCEEDED" : "FAILED") + ".");
-            return valid;
+            if (!hasCookie) {
+                logger.accept("[Auth] No PHPSESSID captured from the recorded sequence.");
+                return false;
+            }
+
+            // Verify the session — but treat an inconclusive result as a soft warning,
+            // not a hard failure.  verifySession may return false on SugarCRM 25.x
+            // when the home page embeds user JSON that trips older heuristics.
+            boolean verified = verifySession(logger);
+            if (!verified) {
+                logger.accept("[Auth] Session verification inconclusive — "
+                    + "proceeding with captured cookie. If scan fails, "
+                    + "re-check target URL or paste the cookie manually on the Configuration tab.");
+            }
+            logger.accept("[Auth] Navigation-Recorder replay " + (verified ? "VERIFIED" : "COOKIE CAPTURED (unverified)") + ".");
+            // Return true as long as we have a usable cookie
+            return true;
 
         } catch (Exception e) {
             logger.accept("[Auth] Navigation-Recorder JSON parse/replay error: " + e.getMessage());
@@ -391,9 +406,28 @@ public class AuthManager implements HttpHandler {
             HttpRequestResponse resp = api.http().sendRequest(req);
             if (resp.response() == null) return false;
 
-            String body  = resp.response().bodyToString();
-            boolean valid = !body.contains("action=Login") && !body.contains("\"user_name\"");
-            logger.accept("[Auth] Session verification: " + (valid ? "VALID" : "INVALID"));
+            String body   = resp.response().bodyToString();
+            int    status = resp.response().statusCode();
+
+            // SugarCRM 25.x embeds {"user_name":"admin",...} JSON in the HOME page for
+            // logged-in users — do NOT test for the string "user_name" generically.
+            // The LOGIN page has <input id="user_name"> in an HTML form.
+            // The LOGIN redirect carries module=Users&action=Login in the Location header.
+            boolean hasLoginForm     = body.contains("id=\"user_name\"")
+                                    || body.contains("name=\"user_name\"");
+            boolean redirectsToLogin = body.contains("action=Login")
+                                    || body.contains("module=Users&action=Login");
+            String  location         = resp.response().headerValue("Location");
+            boolean locationIsLogin  = location != null && location.contains("action=Login");
+
+            boolean valid = status < 400
+                         && !hasLoginForm
+                         && !redirectsToLogin
+                         && !locationIsLogin;
+
+            logger.accept("[Auth] Session verification: " + (valid ? "VALID" : "INVALID")
+                + " (HTTP " + status + ", loginForm=" + hasLoginForm
+                + ", loginRedirect=" + redirectsToLogin + ")");
             return valid;
 
         } catch (Exception e) {

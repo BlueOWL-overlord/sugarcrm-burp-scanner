@@ -477,10 +477,28 @@ public class ConfigPanel {
 
     private void doStartScan() {
         applyConfigFromUI();
+
+        // If a session was captured by "Test Recorded Login" on Tab 3, tfSessionCookie
+        // is already populated and applyConfigFromUI() will have restored it into config.
+        // Only block if we genuinely have nothing to work with.
         if (!config.isAuthenticated()) {
-            log("[!] Not authenticated. Run '1. Login / Refresh Session' first.");
-            return;
+            // Auto-login attempt using the best available method before giving up
+            log("[*] No active session — attempting auto-login before scan...");
+            boolean ok = authManager.login(this::log);
+            if (ok || !config.getSessionCookie().isBlank()) {
+                SwingUtilities.invokeLater(() -> {
+                    tfSessionCookie.setText(config.getSessionCookie());
+                    tfSugarToken.setText(config.getSugarToken());
+                });
+            }
+            if (!config.isAuthenticated()) {
+                log("[!] Authentication failed. Use '1. Login / Refresh Session' or "
+                    + "paste a Navigation Recorder JSON on the 'Recorded Login' tab.");
+                setStatus("Not authenticated", Color.RED);
+                return;
+            }
         }
+
         setStatus("Scanning...", Color.ORANGE);
         log("[*] Starting automated SugarCRM scan...");
 
@@ -507,23 +525,38 @@ public class ConfigPanel {
             return;
         }
         applyConfigFromUI();
-        lblJsonStatus.setText("Status: Testing...");
+        lblJsonStatus.setText("Status: Replaying recorded steps...");
         lblJsonStatus.setForeground(Color.ORANGE);
 
         new Thread(() -> {
             boolean ok = authManager.loginFromRecordedJson(json, this::log);
             SwingUtilities.invokeLater(() -> {
-                if (ok) {
-                    lblJsonStatus.setText("Status: SUCCESS — Session captured: "
-                        + config.getSessionCookie().substring(0,
-                            Math.min(40, config.getSessionCookie().length())) + "...");
-                    lblJsonStatus.setForeground(new Color(0, 140, 0));
-                    tfSessionCookie.setText(config.getSessionCookie());
+                String cookie = config.getSessionCookie();
+                boolean hasCookie = !cookie.isBlank();
+
+                // Always populate the cookie fields with whatever was captured,
+                // regardless of whether full verification succeeded.
+                if (hasCookie) {
+                    tfSessionCookie.setText(cookie);
                     tfSugarToken.setText(config.getSugarToken());
+                }
+
+                if (ok && hasCookie) {
+                    String preview = cookie.length() > 40 ? cookie.substring(0, 40) + "..." : cookie;
+                    lblJsonStatus.setText("Status: SUCCESS — " + preview);
+                    lblJsonStatus.setForeground(new Color(0, 140, 0));
                     setStatus("Authenticated ✓", Color.GREEN);
+                } else if (hasCookie) {
+                    // Cookie captured but verification uncertain (e.g. SugarCRM 25.x JSON heuristic)
+                    lblJsonStatus.setText("Status: Cookie captured — verification inconclusive. "
+                        + "Try 'Start Full Scan' to proceed.");
+                    lblJsonStatus.setForeground(new Color(180, 100, 0));
+                    setStatus("Session captured (check log)", Color.ORANGE);
                 } else {
-                    lblJsonStatus.setText("Status: FAILED — Check the JSON and target URL in the log.");
+                    lblJsonStatus.setText("Status: FAILED — No PHPSESSID captured. "
+                        + "Check the JSON steps and target URL in the scan log.");
                     lblJsonStatus.setForeground(Color.RED);
+                    setStatus("Login FAILED", Color.RED);
                 }
             });
         }, "SugarCRM-RecordedLogin").start();
